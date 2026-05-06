@@ -9,73 +9,144 @@ The application needed to prioritize "Trending" and "Popular" products globally.
 
 ---
 
-## 2. Robust Name Normalization (`cleanName`)
-**What changed**: I implemented a regex-based cleaning function to normalize all product names before comparison.
+## 2. Ingestion Logic (`applyGeoIntelligence`)
+This function processes the backend response and prepares the priority map.
 
-**The Code:**
+**Line-by-Line Explanation:**
 ```typescript
-const cleanName = (s: string) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-```
+applyGeoIntelligence(geoRes: any) {
+  // 1. Identify the categories array from the Geo-Catalog response
+  const categories = geoRes?.catalog?.categories || [];
+  
+  // 2. Clear the scores map to ensure fresh data for each session/pincode
+  this.scoresMap.clear();
 
-**Why we did it**: Retailers often use different punctuation (commas, dots, spaces). Standard string comparison fails in these cases.
-**How it works**:
-1. Converts name to lowercase.
-2. Removes all non-alphanumeric characters.
-3. Example: `"Fortune Oil, 1L."` becomes `"fortuneoil1l"`, ensuring a perfect match with the Geo-Catalog key.
+  // 3. Iterate through each category in the Geo-Catalog
+  categories.forEach((cat: any, catIndex: number) => {
+    const products = cat.products || [];
 
----
+    // 4. Loop through each product within that category
+    products.forEach((p: any) => {
+      // 5. Check if the product is a Trending or Popular match
+      if (p.source === 'TRENDING_MATCH' || p.source === 'POPULAR_MATCH') {
+        
+        // 6. Start with a high global base score (200,000)
+        let score = 200000;
 
-## 3. Global Priority Scoring (The 200,000 Bracket)
-**What changed**: I replaced the old category-based sorting with a **Global Bracket System**.
+        // 7. Add Category Priority: Higher index in Geo-Catalog gets a slightly lower boost
+        score += (10000 - catIndex * 100);
 
-**The Logic:**
-- **Matches (Trending/Popular)**: Base Score = **200,000**
-- **Standard Products**: Base Score = **100,000**
+        // 8. Add Source Bonus: Trending items get a higher boost than Popular items
+        score += (p.source === 'TRENDING_MATCH' ? 2000 : 1000);
 
-**Score Calculation Code:**
-```typescript
-let score = 200000; // Match Base
-score += (10000 - catIndex * 100); // Category Rank (Water > Grocery)
-score += (p.source === 'TRENDING_MATCH' ? 2000 : 1000); // Trend vs Popular Bonus
-score += (p.count || 0); // Tie-breaker count
-```
+        // 9. Add Tie-breaker: Use the 'count' from backend to sort within the same tier
+        score += (p.count || 0);
 
-**Why we did it**: In the "All" tab, we needed matched products from *any* category to appear above *every* unmatched product. By using 200,000 as a base, even the lowest-ranked trending item (200,001) is mathematically guaranteed to stay above the highest-ranked standard item (110,000).
-
----
-
-## 4. Recursive Folder Sorting Engine
-**What changed**: I implemented a recursive tree-traversal logic to ensure sorting applies to all nested UI elements.
-
-**How it works**:
-1. **`performSort()`**: The entry point that identifies if we are looking at a flat list or a folder structure.
-2. **`recursiveSort()`**: A function that drills down into `category.categories` and `subCategory.categories`.
-3. **`sortProductArray()`**: The final engine that sorts the actual `products[]` using the `scoresMap`.
-
-**The Sort Logic:**
-```typescript
-products.sort((a, b) => {
-  const scoreA = scoresMap.get(cleanName(a.product_name)) || 100000;
-  const scoreB = scoresMap.get(cleanName(b.product_name)) || 100000;
-  return scoreB - scoreA; // Descending Priority
-});
+        // 10. Normalize the name and store the score in a high-speed Map
+        const normalizedName = this.cleanName(p.product_name);
+        this.scoresMap.set(normalizedName, score);
+      }
+    });
+  });
+  
+  // 11. Trigger the recursive sorting engine
+  this.performSort();
+}
 ```
 
 ---
 
-## 5. Data Flow: From Backend to UI
-**The Workflow:**
-1. **Fetch**: `this.catalogueService.getGeoCatalog(pincode, shopId)` retrieves the local trending data.
-2. **Ingest**: The system loops through the response and fills a `Map<string, number>` where the key is the `cleanName` and the value is the calculated `Priority Score`.
-3. **Apply**: The UI calls `performSort()`, which traverses the retailer's inventory and re-orders every array based on the scores found in the Map.
-4. **Result**: The "All" tab and individual categories now show Trending items at the very top, followed by Popular items, then standard inventory.
+## 3. Name Normalization (`cleanName`)
+**Code:**
+```typescript
+private cleanName(s: string): string {
+  // 1. Return empty string if input is null/undefined to prevent crashes
+  // 2. Convert to lowercase for case-insensitive matching
+  // 3. Regex [^a-z0-9]: Strip ALL characters that are NOT letters or numbers
+  return (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+```
+**Why**: This ensures that `"Freedom Oil, 1L"` matches `"freedomoil1l"`, bypassing retailer typos or formatting choices.
 
 ---
 
-## 6. Performance Optimization
-- **O(1) Lookups**: By using a `Map` instead of nested loops for matching, the sorting remains fast even if a shop has 5,000+ products.
-- **Single Pass**: The recursion ensures that we only traverse the catalog once to apply the new order.
-- **Production Cleanliness**: All debug logs and temporary sorting files have been removed to ensure zero overhead in the production build.
+## 4. Scoring Engine (`getDetailedScore`)
+This function is used during the sort comparison to find the priority of a specific product.
+
+**Line-by-Line Explanation:**
+```typescript
+private getDetailedScore(productName: string) {
+  // 1. Normalize the retailer's product name
+  const normalized = this.cleanName(productName);
+  
+  // 2. Look up the score in our pre-calculated Map
+  const score = this.scoresMap.get(normalized);
+  
+  // 3. If found, return the high-priority score
+  if (score !== undefined) {
+    return { score, matchName: normalized };
+  }
+  
+  // 4. Fallback: Return a base score of 0 for products with no geo-match
+  return { score: 0, matchName: '' };
+}
+```
+
+---
+
+## 5. Comparison Engine (`sortProductArray`)
+This is the core logic used inside the JavaScript `.sort()` function.
+
+**Line-by-Line Explanation:**
+```typescript
+private sortProductArray(products: any[]) {
+  if (!products) return;
+
+  products.sort((a, b) => {
+    // 1. Get scores for both products being compared
+    const resA = this.getDetailedScore(a.product_name || a.name);
+    const resB = this.getDetailedScore(b.product_name || b.name);
+
+    // 2. Use 100,000 as the base for unmatched items (Category sorting fallback)
+    const scoreA = resA.score || 100000;
+    const scoreB = resB.score || 100000;
+
+    // 3. Return Difference: Sort in descending order (highest score at top)
+    return scoreB - scoreA;
+  });
+}
+```
+
+---
+
+## 6. Recursive Traversal (`recursiveSort`)
+This ensures the logic reaches products nested deep within folders.
+
+**Line-by-Line Explanation:**
+```typescript
+private recursiveSort(categories: any[]) {
+  if (!categories) return;
+
+  categories.forEach(cat => {
+    // 1. If this category has a 'products' array, sort it
+    if (cat.products && Array.isArray(cat.products)) {
+      this.sortProductArray(cat.products);
+    }
+    
+    // 2. If it has sub-categories, call this function again (Recursion)
+    if (cat.categories && Array.isArray(cat.categories)) {
+      this.recursiveSort(cat.categories);
+    }
+  });
+}
+```
+
+---
+
+## 7. Performance & Optimization
+- **Map Lookup ($O(1)$)**: By storing scores in a `Map`, we avoid nested loops during sorting.
+- **Recursive Depth**: The system handles infinite category nesting.
+- **Cleanup**: All `console.log` and temporary files were removed to keep the main bundle light.
 
 ---
 **Implementation Date**: May 2026
